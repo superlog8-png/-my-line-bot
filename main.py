@@ -172,7 +172,56 @@ def fetch_stock_quote(symbol: str) -> dict:
         "exchange": meta.get("exchangeName") or meta.get("fullExchangeName", ""),
         "time": datetime.fromtimestamp(meta.get("regularMarketTime", datetime.now().timestamp())).strftime("%Y/%m/%d %H:%M"),
         "source": "Yahoo Finance",
+        "chart_symbol": meta.get("symbol", symbol),
     }
+
+
+def fetch_stock_history(symbol: str, quote_data: dict | None = None) -> list[dict]:
+    chart_symbol = (quote_data or {}).get("chart_symbol") or symbol
+    params = {
+        "range": "3mo",
+        "interval": "1d",
+        "includePrePost": "false",
+    }
+    response = requests.get(
+        YAHOO_CHART_URL.format(symbol=chart_symbol),
+        params=params,
+        headers=REQUEST_HEADERS,
+        timeout=REQUEST_TIMEOUT,
+    )
+    response.raise_for_status()
+    data = response.json()
+    result = data.get("chart", {}).get("result") or []
+    if not result:
+        raise ValueError(f"No chart data for {chart_symbol}")
+
+    timestamps = result[0].get("timestamp") or []
+    quote_series = (result[0].get("indicators", {}).get("quote") or [{}])[0]
+    opens = quote_series.get("open") or []
+    highs = quote_series.get("high") or []
+    lows = quote_series.get("low") or []
+    closes = quote_series.get("close") or []
+    volumes = quote_series.get("volume") or []
+
+    candles = []
+    for index, timestamp in enumerate(timestamps):
+        try:
+            candle = {
+                "date": datetime.fromtimestamp(timestamp).strftime("%m/%d"),
+                "open": opens[index],
+                "high": highs[index],
+                "low": lows[index],
+                "close": closes[index],
+                "volume": volumes[index] if index < len(volumes) else None,
+            }
+        except IndexError:
+            continue
+        if all(candle[key] is not None for key in ("open", "high", "low", "close")):
+            candles.append(candle)
+
+    if not candles:
+        raise ValueError(f"No usable chart data for {chart_symbol}")
+    return candles[-60:]
 
 
 def fetch_taiwan_stock_quote(code: str) -> dict:
@@ -216,6 +265,7 @@ def fetch_taiwan_stock_quote(code: str) -> dict:
                 "exchange": label,
                 "time": format_twse_time(date_text, time_text),
                 "source": label,
+                "chart_symbol": f"{code}.TWO" if label == "TPEx" else f"{code}.TW",
             }
         except (requests.RequestException, ValueError) as exc:
             errors.append(str(exc))
@@ -261,7 +311,7 @@ def build_stock_messages(user_text: str) -> list[dict] | None:
     if not symbols:
         return None
 
-    messages = []
+    bubbles = []
     fallback_lines = []
     for symbol in symbols:
         try:
@@ -271,20 +321,87 @@ def build_stock_messages(user_text: str) -> list[dict] | None:
             continue
 
         encoded = quote(quote_data["symbol"], safe="")
-        image_url = f"{SERVICE_BASE_URL}/stock-image/{encoded}.png"
-        messages.append(
-            {
-                "type": "image",
-                "originalContentUrl": image_url,
-                "previewImageUrl": image_url,
-            }
-        )
+        chart_url = f"{SERVICE_BASE_URL}/stock-chart/{encoded}.png"
+        bubbles.extend(build_stock_flex_bubbles(quote_data, chart_url))
         fallback_lines.append(stock_text(quote_data))
 
-    if fallback_lines:
-        messages.append({"type": "text", "text": trim_for_line("\n\n".join(fallback_lines))})
+    if bubbles:
+        return [
+            {
+                "type": "flex",
+                "altText": "股票報價與K線圖",
+                "contents": {
+                    "type": "carousel",
+                    "contents": bubbles[:12],
+                },
+            }
+        ]
 
-    return messages or [{"type": "text", "text": "目前查不到報價資料，請確認股票代碼是否正確。"}]
+    return [{"type": "text", "text": trim_for_line("\n\n".join(fallback_lines) or "目前查不到報價資料，請確認股票代碼是否正確。")}]
+
+
+def build_stock_flex_bubbles(quote_data: dict, chart_url: str) -> list[dict]:
+    is_up = quote_data["change"] > 0
+    is_down = quote_data["change"] < 0
+    color = "#DC2626" if is_up else "#16A34A" if is_down else "#64748B"
+    icon = "▲" if is_up else "▼" if is_down else "▬"
+    direction = "上漲" if is_up else "下跌" if is_down else "平盤"
+    title = f"{quote_data['name']} ({quote_data['symbol']})"
+    subtitle = f"{icon} 今日{direction} {quote_data['change']:+.2f} ({quote_data['percent']:+.2f}%)"
+
+    summary_bubble = {
+        "type": "bubble",
+        "size": "mega",
+        "body": {
+            "type": "box",
+            "layout": "vertical",
+            "spacing": "md",
+            "contents": [
+                {"type": "text", "text": title, "weight": "bold", "size": "xl", "wrap": True},
+                {"type": "text", "text": subtitle, "weight": "bold", "size": "lg", "color": color},
+                {"type": "separator"},
+                stock_flex_row("現價", f"{quote_data['price']:.2f} {quote_data['currency']}"),
+                stock_flex_row("昨收", f"{quote_data['previous']:.2f}"),
+                stock_flex_row("交易所", quote_data["exchange"]),
+                stock_flex_row("時間", quote_data["time"]),
+                stock_flex_row("來源", quote_data["source"]),
+            ],
+        },
+    }
+
+    chart_bubble = {
+        "type": "bubble",
+        "size": "mega",
+        "hero": {
+            "type": "image",
+            "url": chart_url,
+            "size": "full",
+            "aspectRatio": "16:9",
+            "aspectMode": "cover",
+        },
+        "body": {
+            "type": "box",
+            "layout": "vertical",
+            "spacing": "sm",
+            "contents": [
+                {"type": "text", "text": f"{quote_data['symbol']} 3個月日K線", "weight": "bold", "size": "lg"},
+                {"type": "text", "text": "紅K代表收高，綠K代表收低。", "size": "sm", "color": "#64748B", "wrap": True},
+            ],
+        },
+    }
+
+    return [summary_bubble, chart_bubble]
+
+
+def stock_flex_row(label: str, value: str) -> dict:
+    return {
+        "type": "box",
+        "layout": "baseline",
+        "contents": [
+            {"type": "text", "text": label, "size": "sm", "color": "#64748B", "flex": 2},
+            {"type": "text", "text": value, "size": "sm", "color": "#111827", "wrap": True, "flex": 5},
+        ],
+    }
 
 
 def build_stock_reply(user_text: str) -> str | None:
@@ -356,6 +473,79 @@ def render_stock_image(quote_data: dict) -> bytes:
     draw.text((110, 455), f"Previous close: {quote_data['previous']:.2f}", fill=muted, font=small_font)
     draw.text((520, 455), f"Time: {quote_data['time']}", fill=muted, font=small_font)
     draw.text((110, 495), f"Source: {quote_data['source']}", fill=muted, font=small_font)
+
+    output = BytesIO()
+    image.save(output, format="PNG", optimize=True)
+    return output.getvalue()
+
+
+def render_candlestick_chart(quote_data: dict, candles: list[dict]) -> bytes:
+    width, height = 1280, 720
+    left, top, right, bottom = 90, 70, 70, 120
+    chart_w = width - left - right
+    chart_h = height - top - bottom
+    bg = (248, 250, 252)
+    card = (255, 255, 255)
+    grid = (226, 232, 240)
+    text = (15, 23, 42)
+    muted = (100, 116, 139)
+    up = (220, 38, 38)
+    down = (22, 163, 74)
+
+    image = Image.new("RGB", (width, height), bg)
+    draw = ImageDraw.Draw(image)
+    draw.rounded_rectangle((28, 28, width - 28, height - 28), radius=30, fill=card)
+
+    title_font = get_font(40)
+    label_font = get_font(24)
+    small_font = get_font(20)
+
+    draw.text((left, 32), f"{quote_data['name']} ({quote_data['symbol']}) 3M Daily Candles", fill=text, font=title_font)
+    draw.text((left, 82), f"Last {quote_data['price']:.2f}  Change {quote_data['change']:+.2f} ({quote_data['percent']:+.2f}%)", fill=muted, font=label_font)
+
+    highs = [candle["high"] for candle in candles]
+    lows = [candle["low"] for candle in candles]
+    max_price = max(highs)
+    min_price = min(lows)
+    padding = (max_price - min_price) * 0.08 or max_price * 0.02 or 1
+    max_price += padding
+    min_price -= padding
+
+    def y_for(price: float) -> float:
+        return top + ((max_price - price) / (max_price - min_price)) * chart_h
+
+    for index in range(6):
+        y = top + chart_h * index / 5
+        price = max_price - (max_price - min_price) * index / 5
+        draw.line((left, y, width - right, y), fill=grid, width=1)
+        draw.text((width - right + 12, y - 12), f"{price:.2f}", fill=muted, font=small_font)
+
+    candle_count = len(candles)
+    step = chart_w / max(candle_count, 1)
+    body_w = max(5, min(18, step * 0.58))
+
+    for index, candle in enumerate(candles):
+        x = left + step * index + step / 2
+        open_y = y_for(candle["open"])
+        close_y = y_for(candle["close"])
+        high_y = y_for(candle["high"])
+        low_y = y_for(candle["low"])
+        color = up if candle["close"] >= candle["open"] else down
+        draw.line((x, high_y, x, low_y), fill=color, width=3)
+        top_y = min(open_y, close_y)
+        bottom_y = max(open_y, close_y)
+        if bottom_y - top_y < 2:
+            bottom_y = top_y + 2
+        draw.rounded_rectangle((x - body_w / 2, top_y, x + body_w / 2, bottom_y), radius=2, fill=color)
+
+    for index in (0, candle_count // 2, candle_count - 1):
+        if 0 <= index < candle_count:
+            x = left + step * index + step / 2
+            draw.text((x - 28, height - bottom + 42), candles[index]["date"], fill=muted, font=small_font)
+
+    draw.line((left, top, left, top + chart_h), fill=(203, 213, 225), width=2)
+    draw.line((left, top + chart_h, width - right, top + chart_h), fill=(203, 213, 225), width=2)
+    draw.text((left, height - 55), f"Source: {quote_data['source']} / Yahoo Finance chart data", fill=muted, font=small_font)
 
     output = BytesIO()
     image.save(output, format="PNG", optimize=True)
@@ -545,6 +735,13 @@ async def preview(category: str):
 async def stock_image(symbol: str):
     quote_data = fetch_stock_quote(symbol.upper())
     return StreamingResponse(BytesIO(render_stock_image(quote_data)), media_type="image/png")
+
+
+@app.get("/stock-chart/{symbol}.png")
+async def stock_chart(symbol: str):
+    quote_data = fetch_stock_quote(symbol.upper())
+    candles = fetch_stock_history(symbol.upper(), quote_data)
+    return StreamingResponse(BytesIO(render_candlestick_chart(quote_data, candles)), media_type="image/png")
 
 
 @app.post("/broadcast/daily")
