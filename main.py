@@ -6,10 +6,14 @@ import textwrap
 import xml.etree.ElementTree as ET
 from datetime import datetime
 from email.utils import parsedate_to_datetime
+from io import BytesIO
+from urllib.parse import quote
 
 import requests
 import uvicorn
 from fastapi import FastAPI, Request
+from fastapi.responses import StreamingResponse
+from PIL import Image, ImageDraw, ImageFont
 
 
 app = FastAPI()
@@ -17,6 +21,7 @@ app = FastAPI()
 LINE_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
 LINE_REPLY_URL = "https://api.line.me/v2/bot/message/reply"
 LINE_BROADCAST_URL = "https://api.line.me/v2/bot/message/broadcast"
+SERVICE_BASE_URL = os.getenv("SERVICE_BASE_URL", "https://my-line-bot-yuht.onrender.com").rstrip("/")
 GOOGLE_NEWS_RSS = "https://news.google.com/rss/search"
 YAHOO_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
 TWSE_STOCK_URL = "https://mis.twse.com.tw/stock/api/getStockInfo.jsp"
@@ -126,6 +131,9 @@ def parse_pub_date(value: str) -> str:
 
 
 def fetch_stock_quote(symbol: str) -> dict:
+    if symbol.endswith(".TW"):
+        return fetch_taiwan_stock_quote(symbol.removesuffix(".TW"))
+
     params = {
         "range": "1d",
         "interval": "1m",
@@ -144,8 +152,8 @@ def fetch_stock_quote(symbol: str) -> dict:
         raise ValueError(f"查無 {symbol} 報價")
 
     meta = result[0].get("meta", {})
-    quote = (result[0].get("indicators", {}).get("quote") or [{}])[0]
-    closes = [price for price in quote.get("close", []) if price is not None]
+    quote_data = (result[0].get("indicators", {}).get("quote") or [{}])[0]
+    closes = [price for price in quote_data.get("close", []) if price is not None]
     current = meta.get("regularMarketPrice") or (closes[-1] if closes else None)
     previous = meta.get("chartPreviousClose") or meta.get("previousClose")
     if current is None or previous is None:
@@ -196,14 +204,15 @@ def fetch_taiwan_stock_quote(code: str) -> dict:
 
             date_text = item.get("d") or datetime.now().strftime("%Y%m%d")
             time_text = item.get("t") or item.get("%") or ""
+            change = current - previous
             return {
                 "symbol": f"{code}.TW",
                 "name": item.get("n") or code,
                 "currency": "TWD",
                 "price": current,
                 "previous": previous,
-                "change": current - previous,
-                "percent": ((current - previous) / previous) * 100 if previous else 0,
+                "change": change,
+                "percent": (change / previous) * 100 if previous else 0,
                 "exchange": label,
                 "time": format_twse_time(date_text, time_text),
                 "source": label,
@@ -231,6 +240,53 @@ def format_twse_time(date_text: str, time_text: str) -> str:
         return f"{date_text} {time_text}".strip()
 
 
+def stock_text(quote_data: dict) -> str:
+    icon = "▲" if quote_data["change"] > 0 else "▼" if quote_data["change"] < 0 else "▬"
+    direction = "上漲" if quote_data["change"] > 0 else "下跌" if quote_data["change"] < 0 else "平盤"
+    return "\n".join(
+        [
+            f"{icon} {quote_data['name']} ({quote_data['symbol']})",
+            f"現價：{quote_data['price']:.2f} {quote_data['currency']}",
+            f"今日{direction}：{quote_data['change']:+.2f} ({quote_data['percent']:+.2f}%)",
+            f"昨收：{quote_data['previous']:.2f}",
+            f"交易所：{quote_data['exchange']}",
+            f"時間：{quote_data['time']}",
+            f"資料來源：{quote_data['source']}",
+        ]
+    )
+
+
+def build_stock_messages(user_text: str) -> list[dict] | None:
+    symbols = resolve_stock_symbols(user_text)
+    if not symbols:
+        return None
+
+    messages = []
+    fallback_lines = []
+    for symbol in symbols:
+        try:
+            quote_data = fetch_stock_quote(symbol)
+        except (requests.RequestException, ValueError) as exc:
+            fallback_lines.append(f"{symbol}\n目前查不到報價資料：{exc}")
+            continue
+
+        encoded = quote(quote_data["symbol"], safe="")
+        image_url = f"{SERVICE_BASE_URL}/stock-image/{encoded}.png"
+        messages.append(
+            {
+                "type": "image",
+                "originalContentUrl": image_url,
+                "previewImageUrl": image_url,
+            }
+        )
+        fallback_lines.append(stock_text(quote_data))
+
+    if fallback_lines:
+        messages.append({"type": "text", "text": trim_for_line("\n\n".join(fallback_lines))})
+
+    return messages or [{"type": "text", "text": "目前查不到報價資料，請確認股票代碼是否正確。"}]
+
+
 def build_stock_reply(user_text: str) -> str | None:
     symbols = resolve_stock_symbols(user_text)
     if not symbols:
@@ -239,31 +295,71 @@ def build_stock_reply(user_text: str) -> str | None:
     replies = []
     for symbol in symbols:
         try:
-            if symbol.endswith(".TW"):
-                quote = fetch_taiwan_stock_quote(symbol.removesuffix(".TW"))
-            else:
-                quote = fetch_stock_quote(symbol)
+            quote_data = fetch_stock_quote(symbol)
+            replies.append(stock_text(quote_data))
         except (requests.RequestException, ValueError) as exc:
             replies.append(f"{symbol}\n目前查不到報價資料：{exc}")
-            continue
-
-        icon = "▲" if quote["change"] > 0 else "▼" if quote["change"] < 0 else "▬"
-        direction = "上漲" if quote["change"] > 0 else "下跌" if quote["change"] < 0 else "平盤"
-        replies.append(
-            "\n".join(
-                [
-                    f"{icon} {quote['name']} ({quote['symbol']})",
-                    f"現價：{quote['price']:.2f} {quote['currency']}",
-                    f"今日{direction}：{quote['change']:+.2f} ({quote['percent']:+.2f}%)",
-                    f"昨收：{quote['previous']:.2f}",
-                    f"交易所：{quote['exchange']}",
-                    f"時間：{quote['time']}",
-                    f"資料來源：{quote['source']}",
-                ]
-            )
-        )
 
     return trim_for_line("\n\n".join(replies))
+
+
+def get_font(size: int) -> ImageFont.ImageFont:
+    for path in (
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "C:/Windows/Fonts/arial.ttf",
+    ):
+        try:
+            return ImageFont.truetype(path, size)
+        except OSError:
+            continue
+    return ImageFont.load_default()
+
+
+def render_stock_image(quote_data: dict) -> bytes:
+    width, height = 1040, 560
+    is_up = quote_data["change"] > 0
+    is_down = quote_data["change"] < 0
+    accent = (220, 38, 38) if is_up else (22, 163, 74) if is_down else (100, 116, 139)
+    bg = (248, 250, 252)
+    card = (255, 255, 255)
+    text = (15, 23, 42)
+    muted = (100, 116, 139)
+
+    image = Image.new("RGB", (width, height), bg)
+    draw = ImageDraw.Draw(image)
+    draw.rounded_rectangle((40, 40, width - 40, height - 40), radius=36, fill=card)
+    draw.rectangle((40, 40, 72, height - 40), fill=accent)
+
+    title_font = get_font(54)
+    symbol_font = get_font(34)
+    price_font = get_font(82)
+    label_font = get_font(30)
+    small_font = get_font(24)
+
+    symbol = quote_data["symbol"]
+    name = quote_data["name"]
+    safe_name = name if len(name) <= 28 else f"{name[:28]}..."
+    direction = "UP" if is_up else "DOWN" if is_down else "FLAT"
+    arrow = "UP" if is_up else "DOWN" if is_down else "FLAT"
+
+    draw.text((110, 90), safe_name, fill=text, font=title_font)
+    draw.text((112, 155), f"{symbol} | {quote_data['exchange']}", fill=muted, font=symbol_font)
+
+    draw.text((110, 230), f"{quote_data['price']:.2f}", fill=text, font=price_font)
+    draw.text((430, 265), quote_data["currency"], fill=muted, font=label_font)
+
+    change_text = f"{arrow} {direction} {quote_data['change']:+.2f} ({quote_data['percent']:+.2f}%)"
+    draw.rounded_rectangle((110, 355, 610, 420), radius=24, fill=accent)
+    draw.text((135, 371), change_text, fill=(255, 255, 255), font=label_font)
+
+    draw.text((110, 455), f"Previous close: {quote_data['previous']:.2f}", fill=muted, font=small_font)
+    draw.text((520, 455), f"Time: {quote_data['time']}", fill=muted, font=small_font)
+    draw.text((110, 495), f"Source: {quote_data['source']}", fill=muted, font=small_font)
+
+    output = BytesIO()
+    image.save(output, format="PNG", optimize=True)
+    return output.getvalue()
 
 
 def build_news_summary(category: str) -> str:
@@ -291,7 +387,7 @@ def build_news_summary(category: str) -> str:
     else:
         title = category
         lead = "以下整理自最新公開新聞結果。"
-        impact = infer_general_impact(category, items)
+        impact = infer_general_impact(category)
 
     bullets = "\n".join(f"- {item['title']}" for item in items[:5])
     sources = "\n".join(
@@ -322,7 +418,7 @@ def infer_finance_impact(items: list[dict]) -> str:
     return "\n".join(f"- {point}" for point in points)
 
 
-def infer_general_impact(category: str, items: list[dict]) -> str:
+def infer_general_impact(category: str) -> str:
     if category == "科技趨勢":
         return "- 觀察 AI、半導體與雲端投資是否延續，並留意估值與產能壓力。"
     if category == "虛擬貨幣":
@@ -376,6 +472,13 @@ def get_news_by_category(user_text: str) -> str:
     return f"請輸入想查看的圖文選單項目：{options}\n也可以直接輸入股票代碼，例如：2330、2317、TSLA、AAPL。"
 
 
+def build_line_messages(user_text: str) -> list[dict]:
+    stock_messages = build_stock_messages(user_text)
+    if stock_messages:
+        return stock_messages
+    return [{"type": "text", "text": get_news_by_category(user_text)}]
+
+
 def build_daily_digest() -> list[str]:
     return [
         build_news_summary("財金重點"),
@@ -387,7 +490,7 @@ def build_daily_digest() -> list[str]:
     ]
 
 
-def reply_to_line(reply_token: str, response_text: str) -> None:
+def reply_to_line(reply_token: str, messages: list[dict]) -> None:
     if not LINE_TOKEN:
         raise RuntimeError("LINE_CHANNEL_ACCESS_TOKEN is not set")
 
@@ -397,7 +500,7 @@ def reply_to_line(reply_token: str, response_text: str) -> None:
     }
     payload = {
         "replyToken": reply_token,
-        "messages": [{"type": "text", "text": response_text}],
+        "messages": messages[:5],
     }
     response = requests.post(
         LINE_REPLY_URL,
@@ -438,6 +541,12 @@ async def preview(category: str):
     return {"category": category, "message": get_news_by_category(category)}
 
 
+@app.get("/stock-image/{symbol}.png")
+async def stock_image(symbol: str):
+    quote_data = fetch_stock_quote(symbol.upper())
+    return StreamingResponse(BytesIO(render_stock_image(quote_data)), media_type="image/png")
+
+
 @app.post("/broadcast/daily")
 async def broadcast_daily():
     messages = build_daily_digest()
@@ -457,10 +566,9 @@ async def handle_webhook(request: Request):
         if message.get("type") != "text":
             continue
 
-        response_text = get_news_by_category(message.get("text", ""))
         reply_token = event.get("replyToken")
         if reply_token:
-            reply_to_line(reply_token, response_text)
+            reply_to_line(reply_token, build_line_messages(message.get("text", "")))
 
     return {"status": "ok"}
 
