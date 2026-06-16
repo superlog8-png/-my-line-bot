@@ -1,5 +1,6 @@
 import html
 import os
+import re
 import sys
 import textwrap
 import xml.etree.ElementTree as ET
@@ -17,6 +18,12 @@ LINE_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
 LINE_REPLY_URL = "https://api.line.me/v2/bot/message/reply"
 LINE_BROADCAST_URL = "https://api.line.me/v2/bot/message/broadcast"
 GOOGLE_NEWS_RSS = "https://news.google.com/rss/search"
+YAHOO_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+TWSE_STOCK_URL = "https://mis.twse.com.tw/stock/api/getStockInfo.jsp"
+REQUEST_HEADERS = {
+    "User-Agent": "Mozilla/5.0",
+    "Referer": "https://mis.twse.com.tw/stock/fibest.jsp?lang=zh_tw",
+}
 REQUEST_TIMEOUT = 12
 MAX_ITEMS = 6
 
@@ -38,6 +45,8 @@ CATEGORY_QUERIES = {
     "國際新聞": "國際 最新 新聞 G7 地緣政治 能源 烏克蘭 中東",
 }
 
+STOCK_PREFIXES = ("股票", "股價", "查股票", "查股價", "代碼")
+
 
 def normalize_text(text: str) -> str:
     return " ".join((text or "").strip().split()).lower()
@@ -52,6 +61,26 @@ def resolve_category(user_text: str) -> str | None:
         if any(normalize_text(alias) in normalized for alias in aliases):
             return category
     return None
+
+
+def resolve_stock_symbols(user_text: str) -> list[str]:
+    text = normalize_text(user_text).upper()
+    for prefix in STOCK_PREFIXES:
+        text = text.replace(prefix.upper(), " ")
+    text = re.sub(r"[^A-Z0-9.^\s]", " ", text)
+    tokens = [token.strip() for token in text.split() if token.strip()]
+
+    symbols = []
+    for token in tokens:
+        if token in {"請給我", "幫我查"}:
+            continue
+        if re.fullmatch(r"\d{4,6}", token):
+            symbols.append(f"{token}.TW")
+        elif re.fullmatch(r"[A-Z]{1,5}(\.[A-Z]{1,3})?", token):
+            symbols.append(token)
+        elif re.fullmatch(r"\^[A-Z0-9]{1,8}", token):
+            symbols.append(token)
+    return symbols[:3]
 
 
 def fetch_google_news(query: str, max_items: int = MAX_ITEMS) -> list[dict]:
@@ -94,6 +123,147 @@ def parse_pub_date(value: str) -> str:
         return parsedate_to_datetime(value).strftime("%Y/%m/%d")
     except (TypeError, ValueError, IndexError):
         return datetime.now().strftime("%Y/%m/%d")
+
+
+def fetch_stock_quote(symbol: str) -> dict:
+    params = {
+        "range": "1d",
+        "interval": "1m",
+        "includePrePost": "false",
+    }
+    response = requests.get(
+        YAHOO_CHART_URL.format(symbol=symbol),
+        params=params,
+        headers=REQUEST_HEADERS,
+        timeout=REQUEST_TIMEOUT,
+    )
+    response.raise_for_status()
+    data = response.json()
+    result = data.get("chart", {}).get("result") or []
+    if not result:
+        raise ValueError(f"查無 {symbol} 報價")
+
+    meta = result[0].get("meta", {})
+    quote = (result[0].get("indicators", {}).get("quote") or [{}])[0]
+    closes = [price for price in quote.get("close", []) if price is not None]
+    current = meta.get("regularMarketPrice") or (closes[-1] if closes else None)
+    previous = meta.get("chartPreviousClose") or meta.get("previousClose")
+    if current is None or previous is None:
+        raise ValueError(f"{symbol} 報價資料不完整")
+
+    change = current - previous
+    percent = (change / previous) * 100 if previous else 0
+    return {
+        "symbol": meta.get("symbol", symbol),
+        "name": meta.get("longName") or meta.get("shortName") or meta.get("symbol", symbol),
+        "currency": meta.get("currency", ""),
+        "price": current,
+        "previous": previous,
+        "change": change,
+        "percent": percent,
+        "exchange": meta.get("exchangeName") or meta.get("fullExchangeName", ""),
+        "time": datetime.fromtimestamp(meta.get("regularMarketTime", datetime.now().timestamp())).strftime("%Y/%m/%d %H:%M"),
+        "source": "Yahoo Finance",
+    }
+
+
+def fetch_taiwan_stock_quote(code: str) -> dict:
+    errors = []
+    for exchange, label in (("tse", "TWSE"), ("otc", "TPEx")):
+        params = {
+            "ex_ch": f"{exchange}_{code}.tw",
+            "json": "1",
+            "delay": "0",
+        }
+        try:
+            response = requests.get(
+                TWSE_STOCK_URL,
+                params=params,
+                headers=REQUEST_HEADERS,
+                timeout=REQUEST_TIMEOUT,
+            )
+            response.raise_for_status()
+            data = response.json()
+            items = data.get("msgArray") or []
+            if not items:
+                continue
+
+            item = items[0]
+            current = parse_float(item.get("z")) or parse_float(item.get("pz"))
+            previous = parse_float(item.get("y"))
+            if current is None or previous is None:
+                continue
+
+            date_text = item.get("d") or datetime.now().strftime("%Y%m%d")
+            time_text = item.get("t") or item.get("%") or ""
+            return {
+                "symbol": f"{code}.TW",
+                "name": item.get("n") or code,
+                "currency": "TWD",
+                "price": current,
+                "previous": previous,
+                "change": current - previous,
+                "percent": ((current - previous) / previous) * 100 if previous else 0,
+                "exchange": label,
+                "time": format_twse_time(date_text, time_text),
+                "source": label,
+            }
+        except (requests.RequestException, ValueError) as exc:
+            errors.append(str(exc))
+
+    raise ValueError("; ".join(errors) or f"查無 {code} 台股報價")
+
+
+def parse_float(value: str | None) -> float | None:
+    try:
+        if value in (None, "", "-", "--"):
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def format_twse_time(date_text: str, time_text: str) -> str:
+    try:
+        value = datetime.strptime(f"{date_text} {time_text}", "%Y%m%d %H:%M:%S")
+        return value.strftime("%Y/%m/%d %H:%M")
+    except ValueError:
+        return f"{date_text} {time_text}".strip()
+
+
+def build_stock_reply(user_text: str) -> str | None:
+    symbols = resolve_stock_symbols(user_text)
+    if not symbols:
+        return None
+
+    replies = []
+    for symbol in symbols:
+        try:
+            if symbol.endswith(".TW"):
+                quote = fetch_taiwan_stock_quote(symbol.removesuffix(".TW"))
+            else:
+                quote = fetch_stock_quote(symbol)
+        except (requests.RequestException, ValueError) as exc:
+            replies.append(f"{symbol}\n目前查不到報價資料：{exc}")
+            continue
+
+        icon = "▲" if quote["change"] > 0 else "▼" if quote["change"] < 0 else "▬"
+        direction = "上漲" if quote["change"] > 0 else "下跌" if quote["change"] < 0 else "平盤"
+        replies.append(
+            "\n".join(
+                [
+                    f"{icon} {quote['name']} ({quote['symbol']})",
+                    f"現價：{quote['price']:.2f} {quote['currency']}",
+                    f"今日{direction}：{quote['change']:+.2f} ({quote['percent']:+.2f}%)",
+                    f"昨收：{quote['previous']:.2f}",
+                    f"交易所：{quote['exchange']}",
+                    f"時間：{quote['time']}",
+                    f"資料來源：{quote['source']}",
+                ]
+            )
+        )
+
+    return trim_for_line("\n\n".join(replies))
 
 
 def build_news_summary(category: str) -> str:
@@ -192,6 +362,10 @@ def trim_for_line(text: str, limit: int = 4800) -> str:
 
 
 def get_news_by_category(user_text: str) -> str:
+    stock_reply = build_stock_reply(user_text)
+    if stock_reply:
+        return stock_reply
+
     category = resolve_category(user_text)
     if category == "星座運勢":
         return build_horoscope()
@@ -199,7 +373,7 @@ def get_news_by_category(user_text: str) -> str:
         return build_news_summary(category)
 
     options = "、".join(CATEGORY_ALIASES.keys())
-    return f"請輸入想查看的圖文選單項目：{options}"
+    return f"請輸入想查看的圖文選單項目：{options}\n也可以直接輸入股票代碼，例如：2330、2317、TSLA、AAPL。"
 
 
 def build_daily_digest() -> list[str]:
