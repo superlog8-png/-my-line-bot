@@ -1,4 +1,5 @@
 import html
+import hashlib
 import os
 import re
 import sys
@@ -12,8 +13,8 @@ from urllib.parse import quote
 
 import requests
 import uvicorn
-from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
 from PIL import Image, ImageDraw, ImageFont
 
 
@@ -42,6 +43,7 @@ FONT_DOWNLOAD_ATTEMPTED = False
 QUOTE_CACHE = {}
 CHART_CACHE = {}
 NEWS_CACHE = {}
+LINK_CACHE = {}
 
 
 def cache_get(cache: dict, key: str, ttl_seconds: int):
@@ -60,12 +62,22 @@ def cache_set(cache: dict, key: str, value):
     return value
 
 
+def make_short_link(url: str) -> str:
+    key = hashlib.sha256(url.encode("utf-8")).hexdigest()[:8]
+    LINK_CACHE[key] = url
+    return f"{SERVICE_BASE_URL}/r/{key}"
+
+
 CATEGORY_ALIASES = {
     "財金重點": {"財金", "財金重點", "財經", "財經重點", "請給我財金重點", "請給我財經"},
     "科技趨勢": {"科技", "科技趨勢", "請給我科技趨勢", "請給我科技"},
     "虛擬貨幣": {"虛擬貨幣", "加密貨幣", "幣圈", "crypto", "請給我虛擬貨幣"},
     "台灣新聞": {"台灣", "台灣新聞", "請給我台灣新聞"},
     "國際新聞": {"國際", "國際新聞", "請給我國際新聞"},
+    "財經新聞": {"財經新聞", "財經", "財經要聞", "財經重點", "金融新聞", "投資新聞"},
+    "社會新聞": {"社會新聞", "社會", "台灣社會", "社會要聞", "民生新聞"},
+    "國際財經": {"國際財經", "全球財經", "國際金融", "全球市場", "國際股市"},
+    "國際社會": {"國際社會", "全球社會", "國際民生", "國際事件", "世界社會"},
     "星座運勢": {"星座", "星座運勢", "運勢", "請給我星座運勢"},
 }
 
@@ -75,6 +87,10 @@ CATEGORY_QUERIES = {
     "虛擬貨幣": "Bitcoin Ethereum ETF 虛擬貨幣 加密貨幣 監管 最新",
     "台灣新聞": "台灣 最新 新聞 政治 經濟 社會 產業",
     "國際新聞": "國際 最新 新聞 G7 地緣政治 能源 烏克蘭 中東",
+    "財經新聞": "site:ctee.com.tw/news 工商時報 財經 股市 投資 金融 產業 最新",
+    "社會新聞": "台灣 社會新聞 民生 治安 交通 教育 生活 最新",
+    "國際財經": "國際財經 全球市場 美股 Fed 匯率 油價 經濟 最新",
+    "國際社會": "國際 新聞 災害 犯罪 人權 最新",
 }
 
 STOCK_PREFIXES = ("股票", "股價", "查股票", "查股價", "代碼")
@@ -717,7 +733,7 @@ def build_news_summary(category: str) -> str:
 
     bullets = "\n".join(f"- {item['title']}" for item in items[:5])
     sources = "\n".join(
-        f"{index}. {item['source']}｜{item['published_at']}\n{item['link']}"
+        f"{index}. {item['source']}｜{item['published_at']} {make_short_link(item['link'])}"
         for index, item in enumerate(items[:3], start=1)
     )
 
@@ -753,6 +769,14 @@ def infer_general_impact(category: str) -> str:
         return "- 觀察政策、產業與民生議題對台股、企業營運與日常生活的影響。"
     if category == "國際新聞":
         return "- 觀察地緣政治、能源與外交事件對全球市場和供應鏈的影響。"
+    if category == "財經新聞":
+        return "- 觀察台股、金融、產業資金流與政策變化對投資情緒的影響。"
+    if category == "社會新聞":
+        return "- 觀察民生、治安、交通、教育與公共安全議題對日常生活的影響。"
+    if category == "國際財經":
+        return "- 觀察美股、利率、匯率、能源與全球資金流向對市場風險偏好的影響。"
+    if category == "國際社會":
+        return "- 觀察災害、社會衝突、人權、民生與跨國事件對區域穩定的影響。"
     return "- 觀察後續發展與是否形成連續性議題。"
 
 
@@ -873,6 +897,14 @@ async def healthz():
 @app.get("/preview/{category}")
 async def preview(category: str):
     return {"category": category, "message": get_news_by_category(category)}
+
+
+@app.get("/r/{key}")
+async def redirect_short_link(key: str):
+    url = LINK_CACHE.get(key)
+    if not url:
+        raise HTTPException(status_code=404, detail="Link expired")
+    return RedirectResponse(url=url, status_code=302)
 
 
 @app.get("/stock-image/{symbol}.png")
