@@ -14,7 +14,7 @@ from urllib.parse import quote
 import requests
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, StreamingResponse
 from PIL import Image, ImageDraw, ImageFont
 
 
@@ -24,6 +24,8 @@ LINE_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
 LINE_REPLY_URL = "https://api.line.me/v2/bot/message/reply"
 LINE_BROADCAST_URL = "https://api.line.me/v2/bot/message/broadcast"
 SERVICE_BASE_URL = os.getenv("SERVICE_BASE_URL", "https://my-line-bot-yuht.onrender.com").rstrip("/")
+PRICE_LIST_IMAGE_PATH = os.path.join(os.path.dirname(__file__), "assets", "price-list.jpg")
+PRICE_LIST_IMAGE_URL = f"{SERVICE_BASE_URL}/price-list.jpg"
 GOOGLE_NEWS_RSS = "https://news.google.com/rss/search"
 YAHOO_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
 TWSE_STOCK_URL = "https://mis.twse.com.tw/stock/api/getStockInfo.jsp"
@@ -94,10 +96,41 @@ CATEGORY_QUERIES = {
 }
 
 STOCK_PREFIXES = ("股票", "股價", "查股票", "查股價", "代碼")
+PRICE_LIST_KEYWORDS = {
+    "按摩",
+    "價目",
+    "價目表",
+    "價格",
+    "價錢",
+    "收費",
+    "服務項目",
+    "按摩價目",
+    "按摩價格",
+    "按摩價目表",
+}
 
 
 def normalize_text(text: str) -> str:
     return " ".join((text or "").strip().split()).lower()
+
+
+def is_price_list_request(user_text: str) -> bool:
+    normalized = normalize_text(user_text)
+    return any(keyword in normalized for keyword in PRICE_LIST_KEYWORDS)
+
+
+def build_price_list_messages() -> list[dict]:
+    return [
+        {
+            "type": "image",
+            "originalContentUrl": PRICE_LIST_IMAGE_URL,
+            "previewImageUrl": PRICE_LIST_IMAGE_URL,
+        },
+        {
+            "type": "text",
+            "text": "這是紳士按摩價目表。可直接點圖片放大查看，也可以回覆想預約的服務項目。",
+        },
+    ]
 
 
 def resolve_category(user_text: str) -> str | None:
@@ -822,10 +855,12 @@ def get_news_by_category(user_text: str) -> str:
         return cache_set(NEWS_CACHE, category, build_news_summary(category))
 
     options = "、".join(CATEGORY_ALIASES.keys())
-    return f"請輸入想查看的圖文選單項目：{options}\n也可以直接輸入股票代碼，例如：2330、2317、TSLA、AAPL。"
+    return f"請輸入想查看的圖文選單項目：{options}、按摩、價目表\n也可以直接輸入股票代碼，例如：2330、2317、TSLA、AAPL。"
 
 
 def build_line_messages(user_text: str) -> list[dict]:
+    if is_price_list_request(user_text):
+        return build_price_list_messages()
     stock_messages = build_stock_messages(user_text)
     if stock_messages:
         return stock_messages
@@ -897,6 +932,11 @@ async def healthz():
 @app.get("/preview/{category}")
 async def preview(category: str):
     return {"category": category, "message": get_news_by_category(category)}
+
+
+@app.get("/price-list.jpg")
+async def price_list_image():
+    return FileResponse(PRICE_LIST_IMAGE_PATH, media_type="image/jpeg")
 
 
 @app.get("/r/{key}")
