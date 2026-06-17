@@ -35,6 +35,9 @@ MAX_ITEMS = 6
 QUOTE_CACHE_TTL_SECONDS = 45
 CHART_CACHE_TTL_SECONDS = 600
 NEWS_CACHE_TTL_SECONDS = 600
+CJK_FONT_URL = "https://github.com/googlefonts/noto-cjk/raw/main/Sans/OTF/TraditionalChinese/NotoSansCJKtc-Regular.otf"
+CJK_FONT_PATH = "/tmp/NotoSansCJKtc-Regular.otf"
+FONT_DOWNLOAD_ATTEMPTED = False
 
 QUOTE_CACHE = {}
 CHART_CACHE = {}
@@ -472,7 +475,16 @@ def build_stock_reply(user_text: str) -> str | None:
 
 
 def get_font(size: int) -> ImageFont.ImageFont:
+    global FONT_DOWNLOAD_ATTEMPTED
     for path in (
+        "C:/Windows/Fonts/msjh.ttc",
+        "C:/Windows/Fonts/msjhbd.ttc",
+        CJK_FONT_PATH,
+        "/opt/render/project/src/NotoSansCJKtc-Regular.otf",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSansCJKtc-Regular.otf",
+        "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
         "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
         "C:/Windows/Fonts/arial.ttf",
@@ -481,6 +493,16 @@ def get_font(size: int) -> ImageFont.ImageFont:
             return ImageFont.truetype(path, size)
         except OSError:
             continue
+    if not FONT_DOWNLOAD_ATTEMPTED:
+        FONT_DOWNLOAD_ATTEMPTED = True
+        try:
+            response = requests.get(CJK_FONT_URL, timeout=8)
+            response.raise_for_status()
+            with open(CJK_FONT_PATH, "wb") as font_file:
+                font_file.write(response.content)
+            return ImageFont.truetype(CJK_FONT_PATH, size)
+        except (OSError, requests.RequestException):
+            pass
     return ImageFont.load_default()
 
 
@@ -531,28 +553,49 @@ def render_stock_image(quote_data: dict) -> bytes:
 
 
 def render_candlestick_chart(quote_data: dict, candles: list[dict]) -> bytes:
-    width, height = 1280, 720
-    left, top, right, bottom = 90, 70, 70, 120
-    chart_w = width - left - right
-    chart_h = height - top - bottom
-    bg = (248, 250, 252)
-    card = (255, 255, 255)
-    grid = (226, 232, 240)
-    text = (15, 23, 42)
-    muted = (100, 116, 139)
-    up = (220, 38, 38)
-    down = (22, 163, 74)
+    width, height = 480, 360
+    bg = (31, 33, 35)
+    grid = (118, 125, 130)
+    axis_text = (215, 225, 235)
+    muted = (137, 146, 153)
+    blue = (86, 166, 255)
+    cyan = (24, 210, 224)
+    up = (0, 192, 118)
+    down = (243, 82, 68)
 
     image = Image.new("RGB", (width, height), bg)
     draw = ImageDraw.Draw(image)
-    draw.rounded_rectangle((28, 28, width - 28, height - 28), radius=30, fill=card)
 
-    title_font = get_font(40)
-    label_font = get_font(24)
-    small_font = get_font(20)
+    title_font = get_font(19)
+    price_font = get_font(18)
+    axis_font = get_font(14)
+    small_font = get_font(13)
 
-    draw.text((left, 32), f"{quote_data['name']} ({quote_data['symbol']}) 3M Daily Candles", fill=text, font=title_font)
-    draw.text((left, 82), f"Last {quote_data['price']:.2f}  Change {quote_data['change']:+.2f} ({quote_data['percent']:+.2f}%)", fill=muted, font=label_font)
+    chart_left, chart_top, chart_right, chart_bottom = 62, 88, 20, 234
+    volume_top, volume_bottom = 274, 324
+    chart_w = width - chart_left - chart_right
+    chart_h = chart_bottom - chart_top
+    plot_right = width - chart_right
+
+    name = quote_data["name"]
+    if len(name) > 12:
+        name = name[:12]
+    code = quote_data["symbol"].split(".")[0]
+    is_up = quote_data["change"] > 0
+    is_down = quote_data["change"] < 0
+    change_color = up if is_up else down if is_down else muted
+    arrow = "▼" if is_down else "▲" if is_up else "▬"
+
+    draw.text((18, 16), f"{name} ({code})", fill=(245, 245, 245), font=title_font)
+    draw.text(
+        (18, 42),
+        f"{quote_data['price']:.1f} {arrow} {quote_data['change']:+.1f} ({quote_data['percent']:+.2f}%)",
+        fill=change_color,
+        font=price_font,
+    )
+    latest_volume = candles[-1].get("volume") or 0
+    volume_text = str(int(latest_volume))
+    draw.text((386, 41), f"量：{volume_text}", fill=blue, font=small_font)
 
     highs = [candle["high"] for candle in candles]
     lows = [candle["low"] for candle in candles]
@@ -563,40 +606,72 @@ def render_candlestick_chart(quote_data: dict, candles: list[dict]) -> bytes:
     min_price -= padding
 
     def y_for(price: float) -> float:
-        return top + ((max_price - price) / (max_price - min_price)) * chart_h
+        return chart_top + ((max_price - price) / (max_price - min_price)) * chart_h
 
-    for index in range(6):
-        y = top + chart_h * index / 5
-        price = max_price - (max_price - min_price) * index / 5
-        draw.line((left, y, width - right, y), fill=grid, width=1)
-        draw.text((width - right + 12, y - 12), f"{price:.2f}", fill=muted, font=small_font)
+    price_ticks = [max_price - (max_price - min_price) * i / 5 for i in range(6)]
+    for price in price_ticks:
+        y = y_for(price)
+        draw.line((chart_left, y, plot_right, y), fill=grid, width=1)
+        label = f"{price:.2f}".rstrip("0").rstrip(".")
+        draw.text((24, y - 8), label, fill=axis_text, font=axis_font)
 
     candle_count = len(candles)
     step = chart_w / max(candle_count, 1)
-    body_w = max(5, min(18, step * 0.58))
+    body_w = max(3, min(7, step * 0.7))
+
+    closes = [candle["close"] for candle in candles]
+    ma_values = []
+    for index in range(candle_count):
+        start = max(0, index - 9)
+        ma_values.append(sum(closes[start : index + 1]) / (index - start + 1))
 
     for index, candle in enumerate(candles):
-        x = left + step * index + step / 2
+        x = chart_left + step * index + step / 2
         open_y = y_for(candle["open"])
         close_y = y_for(candle["close"])
         high_y = y_for(candle["high"])
         low_y = y_for(candle["low"])
         color = up if candle["close"] >= candle["open"] else down
-        draw.line((x, high_y, x, low_y), fill=color, width=3)
+        draw.line((x, high_y, x, low_y), fill=color, width=1)
         top_y = min(open_y, close_y)
         bottom_y = max(open_y, close_y)
         if bottom_y - top_y < 2:
             bottom_y = top_y + 2
-        draw.rounded_rectangle((x - body_w / 2, top_y, x + body_w / 2, bottom_y), radius=2, fill=color)
+        draw.rectangle((x - body_w / 2, top_y, x + body_w / 2, bottom_y), fill=color)
 
-    for index in (0, candle_count // 2, candle_count - 1):
-        if 0 <= index < candle_count:
-            x = left + step * index + step / 2
-            draw.text((x - 28, height - bottom + 42), candles[index]["date"], fill=muted, font=small_font)
+    ma_points = [
+        (chart_left + step * index + step / 2, y_for(value))
+        for index, value in enumerate(ma_values)
+    ]
+    if len(ma_points) > 1:
+        draw.line(ma_points, fill=cyan, width=2)
 
-    draw.line((left, top, left, top + chart_h), fill=(203, 213, 225), width=2)
-    draw.line((left, top + chart_h, width - right, top + chart_h), fill=(203, 213, 225), width=2)
-    draw.text((left, height - 55), f"Source: {quote_data['source']} / Yahoo Finance chart data", fill=muted, font=small_font)
+    volumes = [candle.get("volume") or 0 for candle in candles]
+    max_volume = max(volumes) or 1
+    draw.text((10, volume_top - 5), f"{int(max_volume)}", fill=muted, font=small_font)
+    draw.text((50, volume_bottom - 8), "0", fill=muted, font=small_font)
+    draw.line((chart_left, volume_bottom, plot_right, volume_bottom), fill=grid, width=1)
+
+    for index, candle in enumerate(candles):
+        x = chart_left + step * index + step / 2
+        volume = candle.get("volume") or 0
+        bar_h = (volume / max_volume) * (volume_bottom - volume_top)
+        color = up if candle["close"] >= candle["open"] else down
+        draw.rectangle(
+            (x - body_w / 2, volume_bottom - bar_h, x + body_w / 2, volume_bottom),
+            fill=color,
+        )
+
+    month_positions = []
+    seen_months = set()
+    for index, candle in enumerate(candles):
+        month = candle["date"].split("/")[0]
+        if month not in seen_months:
+            seen_months.add(month)
+            month_positions.append((index, month))
+    for index, month in month_positions[-3:]:
+        x = chart_left + step * index + step / 2
+        draw.text((x - 10, 329), f"{int(month)}月", fill=muted, font=axis_font)
 
     output = BytesIO()
     image.save(output, format="PNG", optimize=True)
