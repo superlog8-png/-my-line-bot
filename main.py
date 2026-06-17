@@ -132,8 +132,18 @@ def parse_pub_date(value: str) -> str:
 
 def fetch_stock_quote(symbol: str) -> dict:
     if symbol.endswith(".TW"):
-        return fetch_taiwan_stock_quote(symbol.removesuffix(".TW"))
+        code = symbol.removesuffix(".TW")
+        try:
+            return fetch_taiwan_stock_quote(code)
+        except ValueError:
+            try:
+                return fetch_yahoo_stock_quote(f"{code}.TW")
+            except (requests.RequestException, ValueError):
+                return fetch_yahoo_stock_quote(f"{code}.TWO")
+    return fetch_yahoo_stock_quote(symbol)
 
+
+def fetch_yahoo_stock_quote(symbol: str) -> dict:
     params = {
         "range": "1d",
         "interval": "1m",
