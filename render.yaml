@@ -8,3 +8,5 @@ services:
     envVars:
       - key: LINE_CHANNEL_ACCESS_TOKEN
         sync: false
+      - key: MASSAGE_LINE_CHANNEL_ACCESS_TOKEN
+        sync: false

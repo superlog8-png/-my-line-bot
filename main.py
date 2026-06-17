@@ -21,6 +21,7 @@ from PIL import Image, ImageDraw, ImageFont
 app = FastAPI()
 
 LINE_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
+MASSAGE_LINE_TOKEN = os.getenv("MASSAGE_LINE_CHANNEL_ACCESS_TOKEN")
 LINE_REPLY_URL = "https://api.line.me/v2/bot/message/reply"
 LINE_BROADCAST_URL = "https://api.line.me/v2/bot/message/broadcast"
 BOT_PROFILE = os.getenv("BOT_PROFILE", "main").strip().lower()
@@ -859,8 +860,8 @@ def get_news_by_category(user_text: str) -> str:
     return f"請輸入想查看的圖文選單項目：{options}\n也可以直接輸入股票代碼，例如：2330、2317、TSLA、AAPL。"
 
 
-def build_line_messages(user_text: str) -> list[dict]:
-    if BOT_PROFILE == "massage":
+def build_line_messages_for_profile(user_text: str, profile: str) -> list[dict]:
+    if profile == "massage":
         if is_price_list_request(user_text):
             return build_price_list_messages()
         return [
@@ -876,6 +877,10 @@ def build_line_messages(user_text: str) -> list[dict]:
     return [{"type": "text", "text": get_news_by_category(user_text)}]
 
 
+def build_line_messages(user_text: str) -> list[dict]:
+    return build_line_messages_for_profile(user_text, BOT_PROFILE)
+
+
 def build_daily_digest() -> list[str]:
     return [
         build_news_summary("財金重點"),
@@ -887,13 +892,13 @@ def build_daily_digest() -> list[str]:
     ]
 
 
-def reply_to_line(reply_token: str, messages: list[dict]) -> None:
-    if not LINE_TOKEN:
-        raise RuntimeError("LINE_CHANNEL_ACCESS_TOKEN is not set")
+def reply_to_line_with_token(reply_token: str, messages: list[dict], token: str | None, env_name: str) -> None:
+    if not token:
+        raise RuntimeError(f"{env_name} is not set")
 
     headers = {
         "Content-Type": "application/json",
-        "Authorization": f"Bearer {LINE_TOKEN}",
+        "Authorization": f"Bearer {token}",
     }
     payload = {
         "replyToken": reply_token,
@@ -906,6 +911,14 @@ def reply_to_line(reply_token: str, messages: list[dict]) -> None:
         timeout=REQUEST_TIMEOUT,
     )
     response.raise_for_status()
+
+
+def reply_to_line(reply_token: str, messages: list[dict]) -> None:
+    reply_to_line_with_token(reply_token, messages, LINE_TOKEN, "LINE_CHANNEL_ACCESS_TOKEN")
+
+
+def reply_to_massage_line(reply_token: str, messages: list[dict]) -> None:
+    reply_to_line_with_token(reply_token, messages, MASSAGE_LINE_TOKEN, "MASSAGE_LINE_CHANNEL_ACCESS_TOKEN")
 
 
 def broadcast_to_line(messages: list[str]) -> None:
@@ -1090,6 +1103,28 @@ async def handle_webhook(request: Request):
             reply_to_line(reply_token, build_line_messages(message.get("text", "")))
 
     return {"status": "ok"}
+
+
+@app.post("/webhook/massage")
+async def handle_massage_webhook(request: Request):
+    body = await request.json()
+    events = body.get("events", [])
+
+    for event in events:
+        if event.get("type") != "message":
+            continue
+        message = event.get("message", {})
+        if message.get("type") != "text":
+            continue
+
+        reply_token = event.get("replyToken")
+        if reply_token:
+            reply_to_massage_line(
+                reply_token,
+                build_line_messages_for_profile(message.get("text", ""), "massage"),
+            )
+
+    return {"status": "ok", "profile": "massage"}
 
 
 if __name__ == "__main__":
