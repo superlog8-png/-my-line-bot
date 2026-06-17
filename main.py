@@ -23,6 +23,7 @@ app = FastAPI()
 LINE_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
 LINE_REPLY_URL = "https://api.line.me/v2/bot/message/reply"
 LINE_BROADCAST_URL = "https://api.line.me/v2/bot/message/broadcast"
+BOT_PROFILE = os.getenv("BOT_PROFILE", "main").strip().lower()
 SERVICE_BASE_URL = os.getenv("SERVICE_BASE_URL", "https://my-line-bot-yuht.onrender.com").rstrip("/")
 PRICE_LIST_IMAGE_PATH = os.path.join(os.path.dirname(__file__), "assets", "price-list.jpg")
 PRICE_LIST_IMAGE_URL = f"{SERVICE_BASE_URL}/price-list.jpg"
@@ -855,12 +856,20 @@ def get_news_by_category(user_text: str) -> str:
         return cache_set(NEWS_CACHE, category, build_news_summary(category))
 
     options = "、".join(CATEGORY_ALIASES.keys())
-    return f"請輸入想查看的圖文選單項目：{options}、按摩、價目表\n也可以直接輸入股票代碼，例如：2330、2317、TSLA、AAPL。"
+    return f"請輸入想查看的圖文選單項目：{options}\n也可以直接輸入股票代碼，例如：2330、2317、TSLA、AAPL。"
 
 
 def build_line_messages(user_text: str) -> list[dict]:
-    if is_price_list_request(user_text):
-        return build_price_list_messages()
+    if BOT_PROFILE == "massage":
+        if is_price_list_request(user_text):
+            return build_price_list_messages()
+        return [
+            {
+                "type": "text",
+                "text": "歡迎使用紳士按摩官方帳號。\n請輸入：按摩、價目、價目表、價格、收費、服務項目。",
+            }
+        ]
+
     stock_messages = build_stock_messages(user_text)
     if stock_messages:
         return stock_messages
@@ -921,12 +930,12 @@ def broadcast_to_line(messages: list[str]) -> None:
 
 @app.get("/")
 async def root():
-    return {"message": "LINE Bot Server is running!"}
+    return {"message": "LINE Bot Server is running!", "profile": BOT_PROFILE}
 
 
 @app.get("/healthz")
 async def healthz():
-    return {"status": "ok"}
+    return {"status": "ok", "profile": BOT_PROFILE}
 
 
 @app.get("/preview/{category}")
