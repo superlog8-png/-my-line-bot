@@ -7,6 +7,7 @@ import xml.etree.ElementTree as ET
 from datetime import datetime
 from email.utils import parsedate_to_datetime
 from io import BytesIO
+from time import time
 from urllib.parse import quote
 
 import requests
@@ -31,6 +32,29 @@ REQUEST_HEADERS = {
 }
 REQUEST_TIMEOUT = 12
 MAX_ITEMS = 6
+QUOTE_CACHE_TTL_SECONDS = 45
+CHART_CACHE_TTL_SECONDS = 600
+NEWS_CACHE_TTL_SECONDS = 600
+
+QUOTE_CACHE = {}
+CHART_CACHE = {}
+NEWS_CACHE = {}
+
+
+def cache_get(cache: dict, key: str, ttl_seconds: int):
+    cached = cache.get(key)
+    if not cached:
+        return None
+    saved_at, value = cached
+    if time() - saved_at > ttl_seconds:
+        cache.pop(key, None)
+        return None
+    return value
+
+
+def cache_set(cache: dict, key: str, value):
+    cache[key] = (time(), value)
+    return value
 
 
 CATEGORY_ALIASES = {
@@ -143,6 +167,14 @@ def fetch_stock_quote(symbol: str) -> dict:
     return fetch_yahoo_stock_quote(symbol)
 
 
+def get_cached_stock_quote(symbol: str) -> dict:
+    key = symbol.upper()
+    cached = cache_get(QUOTE_CACHE, key, QUOTE_CACHE_TTL_SECONDS)
+    if cached is not None:
+        return cached
+    return cache_set(QUOTE_CACHE, key, fetch_stock_quote(key))
+
+
 def fetch_yahoo_stock_quote(symbol: str) -> dict:
     params = {
         "range": "1d",
@@ -232,6 +264,15 @@ def fetch_stock_history(symbol: str, quote_data: dict | None = None) -> list[dic
     if not candles:
         raise ValueError(f"No usable chart data for {chart_symbol}")
     return candles[-60:]
+
+
+def get_cached_stock_history(symbol: str, quote_data: dict | None = None) -> list[dict]:
+    chart_symbol = (quote_data or {}).get("chart_symbol") or symbol
+    key = chart_symbol.upper()
+    cached = cache_get(CHART_CACHE, key, CHART_CACHE_TTL_SECONDS)
+    if cached is not None:
+        return cached
+    return cache_set(CHART_CACHE, key, fetch_stock_history(symbol, quote_data))
 
 
 def fetch_taiwan_stock_quote(code: str) -> dict:
@@ -325,7 +366,7 @@ def build_stock_messages(user_text: str) -> list[dict] | None:
     fallback_lines = []
     for symbol in symbols:
         try:
-            quote_data = fetch_stock_quote(symbol)
+            quote_data = get_cached_stock_quote(symbol)
         except (requests.RequestException, ValueError) as exc:
             fallback_lines.append(f"{symbol}\n目前查不到報價資料：{exc}")
             continue
@@ -422,7 +463,7 @@ def build_stock_reply(user_text: str) -> str | None:
     replies = []
     for symbol in symbols:
         try:
-            quote_data = fetch_stock_quote(symbol)
+            quote_data = get_cached_stock_quote(symbol)
             replies.append(stock_text(quote_data))
         except (requests.RequestException, ValueError) as exc:
             replies.append(f"{symbol}\n目前查不到報價資料：{exc}")
@@ -563,6 +604,10 @@ def render_candlestick_chart(quote_data: dict, candles: list[dict]) -> bytes:
 
 
 def build_news_summary(category: str) -> str:
+    cached_summary = cache_get(NEWS_CACHE, category, NEWS_CACHE_TTL_SECONDS)
+    if cached_summary is not None:
+        return cached_summary
+
     query = CATEGORY_QUERIES[category]
     try:
         items = fetch_google_news(query)
@@ -666,7 +711,10 @@ def get_news_by_category(user_text: str) -> str:
     if category == "星座運勢":
         return build_horoscope()
     if category in CATEGORY_QUERIES:
-        return build_news_summary(category)
+        cached_summary = cache_get(NEWS_CACHE, category, NEWS_CACHE_TTL_SECONDS)
+        if cached_summary is not None:
+            return cached_summary
+        return cache_set(NEWS_CACHE, category, build_news_summary(category))
 
     options = "、".join(CATEGORY_ALIASES.keys())
     return f"請輸入想查看的圖文選單項目：{options}\n也可以直接輸入股票代碼，例如：2330、2317、TSLA、AAPL。"
@@ -736,6 +784,11 @@ async def root():
     return {"message": "LINE Bot Server is running!"}
 
 
+@app.get("/healthz")
+async def healthz():
+    return {"status": "ok"}
+
+
 @app.get("/preview/{category}")
 async def preview(category: str):
     return {"category": category, "message": get_news_by_category(category)}
@@ -743,14 +796,14 @@ async def preview(category: str):
 
 @app.get("/stock-image/{symbol}.png")
 async def stock_image(symbol: str):
-    quote_data = fetch_stock_quote(symbol.upper())
+    quote_data = get_cached_stock_quote(symbol.upper())
     return StreamingResponse(BytesIO(render_stock_image(quote_data)), media_type="image/png")
 
 
 @app.get("/stock-chart/{symbol}.png")
 async def stock_chart(symbol: str):
-    quote_data = fetch_stock_quote(symbol.upper())
-    candles = fetch_stock_history(symbol.upper(), quote_data)
+    quote_data = get_cached_stock_quote(symbol.upper())
+    candles = get_cached_stock_history(symbol.upper(), quote_data)
     return StreamingResponse(BytesIO(render_candlestick_chart(quote_data, candles)), media_type="image/png")
 
 
