@@ -13,7 +13,7 @@ from urllib.parse import quote
 import requests
 import uvicorn
 from fastapi import FastAPI, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
 from PIL import Image, ImageDraw, ImageFont
 
 
@@ -376,7 +376,8 @@ def build_stock_messages(user_text: str) -> list[dict] | None:
 
         encoded = quote(quote_data["symbol"], safe="")
         chart_url = f"{SERVICE_BASE_URL}/stock-chart/{encoded}.png"
-        bubbles.extend(build_stock_flex_bubbles(quote_data, chart_url))
+        detail_url = f"{SERVICE_BASE_URL}/stock-detail/{encoded}"
+        bubbles.extend(build_stock_flex_bubbles(quote_data, chart_url, detail_url))
         fallback_lines.append(stock_text(quote_data))
 
     if bubbles:
@@ -394,7 +395,7 @@ def build_stock_messages(user_text: str) -> list[dict] | None:
     return [{"type": "text", "text": trim_for_line("\n\n".join(fallback_lines) or "目前查不到報價資料，請確認股票代碼是否正確。")}]
 
 
-def build_stock_flex_bubbles(quote_data: dict, chart_url: str) -> list[dict]:
+def build_stock_flex_bubbles(quote_data: dict, chart_url: str, detail_url: str) -> list[dict]:
     is_up = quote_data["change"] > 0
     is_down = quote_data["change"] < 0
     color = "#DC2626" if is_up else "#16A34A" if is_down else "#64748B"
@@ -432,6 +433,11 @@ def build_stock_flex_bubbles(quote_data: dict, chart_url: str) -> list[dict]:
             "size": "full",
             "aspectRatio": "16:9",
             "aspectMode": "cover",
+            "action": {
+                "type": "uri",
+                "label": "查看詳細資訊",
+                "uri": detail_url,
+            },
         },
         "body": {
             "type": "box",
@@ -880,6 +886,103 @@ async def stock_chart(symbol: str):
     quote_data = get_cached_stock_quote(symbol.upper())
     candles = get_cached_stock_history(symbol.upper(), quote_data)
     return StreamingResponse(BytesIO(render_candlestick_chart(quote_data, candles)), media_type="image/png")
+
+
+@app.get("/stock-detail/{symbol}", response_class=HTMLResponse)
+async def stock_detail(symbol: str):
+    quote_data = get_cached_stock_quote(symbol.upper())
+    encoded = quote(quote_data["symbol"], safe="")
+    chart_url = f"{SERVICE_BASE_URL}/stock-chart/{encoded}.png"
+    is_up = quote_data["change"] > 0
+    is_down = quote_data["change"] < 0
+    color = "#00c076" if is_up else "#f35244" if is_down else "#9ca3af"
+    arrow = "▲" if is_up else "▼" if is_down else "▬"
+    direction = "上漲" if is_up else "下跌" if is_down else "平盤"
+    title = html.escape(f"{quote_data['name']} ({quote_data['symbol']})")
+    rows = [
+        ("現價", f"{quote_data['price']:.2f} {quote_data['currency']}"),
+        ("今日漲跌", f"{arrow} {direction} {quote_data['change']:+.2f} ({quote_data['percent']:+.2f}%)"),
+        ("昨收", f"{quote_data['previous']:.2f}"),
+        ("交易所", quote_data["exchange"]),
+        ("時間", quote_data["time"]),
+        ("資料來源", quote_data["source"]),
+    ]
+    row_html = "\n".join(
+        f"<div class='row'><span>{html.escape(label)}</span><strong>{html.escape(value)}</strong></div>"
+        for label, value in rows
+    )
+    return f"""
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{title}</title>
+  <style>
+    body {{
+      margin: 0;
+      background: #111827;
+      color: #f9fafb;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans TC", sans-serif;
+    }}
+    main {{
+      max-width: 760px;
+      margin: 0 auto;
+      padding: 20px;
+    }}
+    .card {{
+      background: #1f2328;
+      border-radius: 16px;
+      padding: 18px;
+      box-shadow: 0 10px 28px rgba(0, 0, 0, .28);
+    }}
+    h1 {{
+      margin: 0 0 6px;
+      font-size: 24px;
+    }}
+    .change {{
+      color: {color};
+      font-size: 22px;
+      font-weight: 700;
+      margin-bottom: 14px;
+    }}
+    img {{
+      width: 100%;
+      border-radius: 10px;
+      display: block;
+      background: #202224;
+    }}
+    .rows {{
+      margin-top: 14px;
+      border-top: 1px solid #374151;
+    }}
+    .row {{
+      display: flex;
+      justify-content: space-between;
+      gap: 16px;
+      padding: 12px 0;
+      border-bottom: 1px solid #374151;
+    }}
+    .row span {{
+      color: #9ca3af;
+    }}
+    .row strong {{
+      text-align: right;
+    }}
+  </style>
+</head>
+<body>
+  <main>
+    <section class="card">
+      <h1>{title}</h1>
+      <div class="change">{html.escape(rows[1][1])}</div>
+      <img src="{html.escape(chart_url)}" alt="{title} K線圖">
+      <div class="rows">{row_html}</div>
+    </section>
+  </main>
+</body>
+</html>
+"""
 
 
 @app.post("/broadcast/daily")
