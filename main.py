@@ -17,6 +17,12 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, StreamingResponse
 from PIL import Image, ImageDraw, ImageFont
 
+from daily_digest import (
+    broadcast_digest_messages,
+    build_daily_digest_messages,
+    build_daily_digest_sections,
+)
+
 
 app = FastAPI()
 
@@ -871,25 +877,104 @@ def build_line_messages_for_profile(user_text: str, profile: str) -> list[dict]:
             }
         ]
 
-    stock_messages = build_stock_messages(user_text)
-    if stock_messages:
-        return stock_messages
-    return [{"type": "text", "text": get_news_by_category(user_text)}]
+    return build_main_profile_messages(user_text)
 
 
 def build_line_messages(user_text: str) -> list[dict]:
     return build_line_messages_for_profile(user_text, BOT_PROFILE)
 
 
+POSTBACK_CATEGORY_MAP = {
+    "finance": "財金重點",
+    "tech": "科技趨勢",
+    "crypto": "虛擬貨幣",
+    "taiwan": "台灣新聞",
+    "world": "國際新聞",
+    "horoscope": "星座運勢",
+    "price-list": "價目表",
+    "price_list": "價目表",
+}
+
+DIGEST_CATEGORY_MAP = {
+    "finance": "finance",
+    "財金重點": "finance",
+    "tech": "tech",
+    "科技趨勢": "tech",
+    "crypto": "crypto",
+    "虛擬貨幣": "crypto",
+    "taiwan": "taiwan",
+    "台灣新聞": "taiwan",
+    "world": "world",
+    "國際新聞": "world",
+    "horoscope": "horoscope",
+    "星座運勢": "horoscope",
+}
+
+
+def decode_postback_data(data: str) -> str:
+    raw = (data or "").strip()
+    if not raw:
+        return ""
+
+    normalized = raw.replace("&", ";")
+    pairs = {}
+    for chunk in normalized.split(";"):
+        if "=" not in chunk:
+            continue
+        key, value = chunk.split("=", 1)
+        pairs[key.strip().lower()] = value.strip()
+
+    for key in ("category", "menu", "action", "type"):
+        value = pairs.get(key, "")
+        if value:
+            return POSTBACK_CATEGORY_MAP.get(value.lower(), value)
+
+    return POSTBACK_CATEGORY_MAP.get(raw.lower(), raw)
+
+
+def get_digest_message_by_category(name: str) -> str | None:
+    digest_key = DIGEST_CATEGORY_MAP.get((name or "").strip())
+    if not digest_key:
+        return None
+
+    for section in build_daily_digest_sections():
+        if section.key == digest_key:
+            return section.render()
+    return None
+
+
+def build_main_profile_messages(user_text: str) -> list[dict]:
+    digest_message = get_digest_message_by_category(user_text)
+    if digest_message:
+        return [{"type": "text", "text": trim_for_line(digest_message)}]
+
+    stock_messages = build_stock_messages(user_text)
+    if stock_messages:
+        return stock_messages
+
+    return [{"type": "text", "text": get_news_by_category(user_text)}]
+
+
+def build_line_messages_from_event(event: dict, profile: str) -> list[dict] | None:
+    event_type = event.get("type")
+
+    if event_type == "message":
+        message = event.get("message", {})
+        if message.get("type") != "text":
+            return None
+        return build_line_messages_for_profile(message.get("text", ""), profile)
+
+    if event_type == "postback":
+        resolved = decode_postback_data(event.get("postback", {}).get("data", ""))
+        if not resolved:
+            return [{"type": "text", "text": "此圖文選單項目尚未設定內容。"}]
+        return build_line_messages_for_profile(resolved, profile)
+
+    return None
+
+
 def build_daily_digest() -> list[str]:
-    return [
-        build_news_summary("財金重點"),
-        build_news_summary("科技趨勢"),
-        build_news_summary("虛擬貨幣"),
-        build_news_summary("台灣新聞"),
-        build_news_summary("國際新聞"),
-        build_horoscope(),
-    ]
+    return build_daily_digest_messages()
 
 
 def reply_to_line_with_token(reply_token: str, messages: list[dict], token: str | None, env_name: str) -> None:
@@ -922,23 +1007,9 @@ def reply_to_massage_line(reply_token: str, messages: list[dict]) -> None:
 
 
 def broadcast_to_line(messages: list[str]) -> None:
-    if not LINE_TOKEN:
-        raise RuntimeError("LINE_CHANNEL_ACCESS_TOKEN is not set")
-
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {LINE_TOKEN}",
-    }
-
-    for text in messages:
-        payload = {"messages": [{"type": "text", "text": trim_for_line(text)}]}
-        response = requests.post(
-            LINE_BROADCAST_URL,
-            headers=headers,
-            json=payload,
-            timeout=REQUEST_TIMEOUT,
-        )
-        response.raise_for_status()
+    result = broadcast_digest_messages(messages, LINE_TOKEN)
+    if not result.get("ok"):
+        raise RuntimeError(result["reason"])
 
 
 @app.get("/")
@@ -1082,8 +1153,15 @@ async def stock_detail(symbol: str):
 @app.post("/broadcast/daily")
 async def broadcast_daily():
     messages = build_daily_digest()
-    broadcast_to_line(messages)
-    return {"status": "ok", "message_count": len(messages)}
+    result = broadcast_digest_messages(messages, LINE_TOKEN)
+    if not result.get("ok"):
+        return {
+            "status": "error",
+            "reason": result["reason"],
+            "message_count": len(messages),
+            "messages": messages,
+        }
+    return {"status": "ok", "message_count": result["message_count"], "messages": messages}
 
 
 @app.post("/webhook")
@@ -1092,15 +1170,10 @@ async def handle_webhook(request: Request):
     events = body.get("events", [])
 
     for event in events:
-        if event.get("type") != "message":
-            continue
-        message = event.get("message", {})
-        if message.get("type") != "text":
-            continue
-
         reply_token = event.get("replyToken")
-        if reply_token:
-            reply_to_line(reply_token, build_line_messages(message.get("text", "")))
+        messages = build_line_messages_from_event(event, "main")
+        if reply_token and messages:
+            reply_to_line(reply_token, messages)
 
     return {"status": "ok"}
 
@@ -1111,18 +1184,10 @@ async def handle_massage_webhook(request: Request):
     events = body.get("events", [])
 
     for event in events:
-        if event.get("type") != "message":
-            continue
-        message = event.get("message", {})
-        if message.get("type") != "text":
-            continue
-
         reply_token = event.get("replyToken")
-        if reply_token:
-            reply_to_massage_line(
-                reply_token,
-                build_line_messages_for_profile(message.get("text", ""), "massage"),
-            )
+        messages = build_line_messages_from_event(event, "massage")
+        if reply_token and messages:
+            reply_to_massage_line(reply_token, messages)
 
     return {"status": "ok", "profile": "massage"}
 
