@@ -15,6 +15,7 @@ import requests
 
 
 REQUEST_TIMEOUT = 15
+SECTION_CACHE_TTL_SECONDS = 900
 LINE_BROADCAST_URL = "https://api.line.me/v2/bot/message/broadcast"
 GOOGLE_NEWS_RSS = "https://news.google.com/rss/search"
 CTEE_SITE = "https://www.ctee.com.tw/"
@@ -32,6 +33,9 @@ try:
     TAIPEI_TZ = ZoneInfo("Asia/Taipei")
 except ZoneInfoNotFoundError:
     TAIPEI_TZ = timezone(timedelta(hours=8))
+
+HTTP = requests.Session()
+DIGEST_CACHE: dict[str, tuple[float, object]] = {}
 
 
 @dataclass
@@ -67,8 +71,24 @@ def _today_tw() -> str:
     return datetime.now(TAIPEI_TZ).strftime("%Y/%m/%d")
 
 
+def _cache_get(key: str, ttl_seconds: int):
+    cached = DIGEST_CACHE.get(key)
+    if not cached:
+        return None
+    saved_at, value = cached
+    if datetime.now().timestamp() - saved_at > ttl_seconds:
+        DIGEST_CACHE.pop(key, None)
+        return None
+    return value
+
+
+def _cache_set(key: str, value):
+    DIGEST_CACHE[key] = (datetime.now().timestamp(), value)
+    return value
+
+
 def _fetch_text(url: str, *, params: dict | None = None) -> str:
-    response = requests.get(
+    response = HTTP.get(
         url,
         params=params,
         headers=DEFAULT_HEADERS,
@@ -184,7 +204,7 @@ def _format_sources(items: list[NewsItem], *, prefix: str | None = None, limit: 
 
 def _fetch_ctee_status() -> tuple[bool, str | None]:
     try:
-        response = requests.get(CTEE_SITE, headers=DEFAULT_HEADERS, timeout=REQUEST_TIMEOUT)
+        response = HTTP.get(CTEE_SITE, headers=DEFAULT_HEADERS, timeout=REQUEST_TIMEOUT)
         response.raise_for_status()
         if "請稍後再試" in response.text or "Access Denied" in response.text:
             return False, "工商時報來源目前不可取用"
@@ -196,7 +216,7 @@ def _fetch_ctee_status() -> tuple[bool, str | None]:
 def _fetch_yahoo_quote(symbol: str) -> float | None:
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
     try:
-        response = requests.get(
+        response = HTTP.get(
             url,
             params={"range": "1d", "interval": "1m", "includePrePost": "false"},
             headers=DEFAULT_HEADERS,
@@ -432,6 +452,11 @@ def build_horoscope_section() -> DigestSection:
 
 
 def build_daily_digest_sections() -> list[DigestSection]:
+    cache_key = f"digest_sections:{_today_tw()}"
+    cached_sections = _cache_get(cache_key, SECTION_CACHE_TTL_SECONDS)
+    if cached_sections is not None:
+        return cached_sections
+
     builders: list[Callable[[], DigestSection]] = [
         build_finance_section,
         build_tech_section,
@@ -440,11 +465,15 @@ def build_daily_digest_sections() -> list[DigestSection]:
         build_world_section,
         build_horoscope_section,
     ]
-    return [builder() for builder in builders]
+    return _cache_set(cache_key, [builder() for builder in builders])
 
 
 def build_daily_digest_messages() -> list[str]:
-    return [section.render() for section in build_daily_digest_sections()]
+    cache_key = f"digest_messages:{_today_tw()}"
+    cached_messages = _cache_get(cache_key, SECTION_CACHE_TTL_SECONDS)
+    if cached_messages is not None:
+        return cached_messages
+    return _cache_set(cache_key, [section.render() for section in build_daily_digest_sections()])
 
 
 def broadcast_digest_messages(messages: list[str], token: str | None = None) -> dict:
