@@ -20,7 +20,7 @@ from PIL import Image, ImageDraw, ImageFont
 from daily_digest import (
     broadcast_digest_messages,
     build_daily_digest_messages,
-    build_daily_digest_sections,
+    build_daily_digest_section,
 )
 
 
@@ -937,10 +937,7 @@ def get_digest_message_by_category(name: str) -> str | None:
     if not digest_key:
         return None
 
-    for section in build_daily_digest_sections():
-        if section.key == digest_key:
-            return section.render()
-    return None
+    return build_daily_digest_section(digest_key).render()
 
 
 def build_main_profile_messages(user_text: str) -> list[dict]:

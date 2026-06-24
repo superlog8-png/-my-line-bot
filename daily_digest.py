@@ -451,21 +451,36 @@ def build_horoscope_section() -> DigestSection:
     )
 
 
+SECTION_BUILDERS: dict[str, Callable[[], DigestSection]] = {
+    "finance": build_finance_section,
+    "tech": build_tech_section,
+    "crypto": build_crypto_section,
+    "taiwan": build_taiwan_section,
+    "world": build_world_section,
+    "horoscope": build_horoscope_section,
+}
+
+
+def build_daily_digest_section(key: str) -> DigestSection:
+    cache_key = f"digest_section:{_today_tw()}:{key}"
+    cached_section = _cache_get(cache_key, SECTION_CACHE_TTL_SECONDS)
+    if cached_section is not None:
+        return cached_section
+
+    builder = SECTION_BUILDERS.get(key)
+    if builder is None:
+        raise KeyError(f"Unknown digest section: {key}")
+    return _cache_set(cache_key, builder())
+
+
 def build_daily_digest_sections() -> list[DigestSection]:
     cache_key = f"digest_sections:{_today_tw()}"
     cached_sections = _cache_get(cache_key, SECTION_CACHE_TTL_SECONDS)
     if cached_sections is not None:
         return cached_sections
 
-    builders: list[Callable[[], DigestSection]] = [
-        build_finance_section,
-        build_tech_section,
-        build_crypto_section,
-        build_taiwan_section,
-        build_world_section,
-        build_horoscope_section,
-    ]
-    return _cache_set(cache_key, [builder() for builder in builders])
+    sections = [build_daily_digest_section(key) for key in SECTION_BUILDERS]
+    return _cache_set(cache_key, sections)
 
 
 def build_daily_digest_messages() -> list[str]:
